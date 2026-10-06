@@ -26,13 +26,24 @@ type Account struct {
 	MaxInFlight int    `json:"max_inflight"`
 	Home        string `json:"home"`
 	CreatedAt   string `json:"created_at"`
+
+	// 自动签到（照 trae-free 的同名字段设计）。
+	//
+	// AutoCheckin 是账号级开关：打开后，服务端每天本地时间 CheckinHourLocal
+	// 之后会自动签一次，且每个账号每个本地日**最多一次**。
+	// LastCheckinAt 是 RFC3339 本地时间，前 10 字节即本地日期 —— 「一天一次」
+	// 的守卫直接比对这 10 字节即可，不必再存一份日期。
+	// LastCheckinMsg 记最后一次的结果文案，账号表直接展示、不用再跑一次请求。
+	AutoCheckin    bool   `json:"auto_checkin,omitempty"`
+	LastCheckinAt  string `json:"last_checkin_at,omitempty"`
+	LastCheckinMsg string `json:"last_checkin_msg,omitempty"`
 }
 
 type Store struct {
-	mu   sync.Mutex
-	dir  string
+	mu    sync.Mutex
+	dir   string
 	homes string
-	list []Account
+	list  []Account
 }
 
 func Open(dir, homesDir string) (*Store, error) {

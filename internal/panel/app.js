@@ -142,7 +142,12 @@ function renderAccounts(d) {
       ? `<div class="hint" style="font-size:11px;color:var(--bad);margin-top:3px" title="${esc(row.last_err)}">${esc(row.last_err.slice(0, 72))}</div>` : "";
     const acts = [
       `<button class="xs" data-a="quota" data-id="${row.id}">额度</button>`,
-      row.region === "cn" ? `<button class="xs" data-a="checkin" data-id="${row.id}">签到</button>` : "",
+      // 签到与自动签到都**不再按 region 卡**：服务端已支持 global
+      // （openapi.qoder.sh），国际版账号也能签。
+      `<button class="xs" data-a="checkin" data-id="${row.id}">签到</button>`,
+      row.enabled
+        ? `<button class="xs" data-a="autocheckin" data-id="${row.id}" title="每天 ${row.checkin_hour ?? 10} 点后自动签到一次">自动·${row.auto_checkin ? "开" : "关"}</button>`
+        : "",
       row.auth_type !== "oauth"
         ? `<button class="xs primary" data-a="login" data-id="${row.id}">登录</button>`
         : `<button class="xs" data-a="rewarm" data-id="${row.id}">重建</button>`,
@@ -176,6 +181,12 @@ $("accBody").addEventListener("click", async (ev) => {
       if (!confirm("删除账号「" + (acct.name || id) + "」？（仅移除注册信息，凭证目录 data/homes 保留）")) return;
       await api("accounts/" + id + "/delete", { method: "POST" });
       toast("已删除", "ok");
+    } else if (a === "autocheckin") {
+      // 开关是**切换**语义：按当前状态决定调 on 还是 off，
+      // 服务端只认 autocheckin/on | autocheckin/off 两个动作。
+      const next = !acct.auto_checkin;
+      await api("accounts/" + id + "/autocheckin/" + (next ? "on" : "off"), { method: "POST" });
+      toast(next ? "已开启自动签到" : "已关闭自动签到", "ok");
     } else {
       await api("accounts/" + id + "/" + a, { method: "POST" });
       toast({ enable: "已启用", disable: "已禁用", rewarm: "已请求重建上下文", checkin: "签到完成" }[a] || "完成", "ok");
@@ -474,6 +485,9 @@ async function loadConfig() {
     form.session_sticky.checked = !!cfg.session_sticky;
     form.stats_enabled.checked = !!cfg.stats_enabled;
     form.stats_keep_days.value = cfg.stats_keep_days || 30;
+    // 0 是合法值（= 过本地零点就允许自动签到），必须用 ?? 而不是 ||：
+    // 写成 `|| 10` 会把用户显式设的 0 顶回 10。
+    form.checkin_hour_local.value = String(cfg.checkin_hour_local ?? 10);
     // 0 是合法值（= 走上游目录默认），不能写成 `|| 0` 之外的花样
     form.context_window.value = String(cfg.context_window ?? 0);
     form.proxy_url.value = cfg.proxy_url || "";
@@ -506,6 +520,7 @@ $("cfgForm").addEventListener("submit", async (ev) => {
         session_sticky: form.session_sticky.checked,
         stats_enabled: form.stats_enabled.checked,
         stats_keep_days: +form.stats_keep_days.value,
+        checkin_hour_local: +form.checkin_hour_local.value,
         context_window: +form.context_window.value,
         proxy_url: form.proxy_url.value.trim(),
       }),

@@ -96,6 +96,10 @@ func main() {
 
 	go srv.WarmLoop(ctx)
 	go pnl.StartQuotaLoop(ctx)
+	// 自动签到调度（照 trae-free）：每天本地 CheckinHourLocal 之后，
+	// 为开启了 AutoCheckin 的账号各签一次。默认 10 点 —— qoder 的活动
+	// 10:00（UTC+8）才刷新，0~9 点签会落在前一天周期里拿不到新积分。
+	go pnl.StartCheckinLoop(ctx)
 
 	go func() {
 		log.Printf("qoder-free %s listening on http://%s", panel.Version, cfg.Listen)

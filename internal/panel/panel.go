@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -100,6 +101,165 @@ func (p *Panel) StartQuotaLoop(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// StartCheckinLoop 每天为「开启了自动签到」的账号跑一次 qoder CN 签到。
+// 设计照抄 trae-free 的 `Panel.StartCheckinLoop`：
+// 用短周期 ticker 轮询，但真正的守卫是「账号级 + 本地日」两道 ——
+// 所以一天最多签一次，不会重复打上游。
+//
+// 为什么默认在本地 10:00 之后才签（Cfg.CheckinHourLocal）：
+// qoder 的签到活动不是本地零点刷新 —— 上游活动描述原文是
+// 「每日 10:00（UTC+8）刷新」，活动窗口实测 10:00 → 次日 09:59。
+// 0~9 点签会落在**前一天**的周期里，只会拿到「今日已签到」而拿不到新积分。
+func (p *Panel) StartCheckinLoop(ctx context.Context) {
+	// 先立刻跑一次再进 ticker 循环 —— 与 `StartQuotaLoop` 同一做法。
+	//
+	// 为什么必要：`time.NewTicker` 的**首次触发要等满一个周期**（10 分钟）。
+	// 不先跑一次的话，服务重启后要等 10 分钟才可能补签，而重启往往就发生在
+	// 「刚过 10 点、正想补签」的时候。这里先同步跑一次，把等待降到 0。
+	// 有「一天一次」的守卫兜底，重复调用不会重复签到。
+	// 立刻跑一次，并**用它的返回值决定首次间隔**。
+	//
+	// 这里踩过一个坑：先前写成「先 runAutoCheckin 丢掉返回值、next 直接设为
+	// idleEvery(10 分钟)」。但启动那一刻 worker 通常还没就绪，这次必然全部跳过、
+	// 返回 pending=true —— 结果却要干等 10 分钟才重试。
+	// 现在把首次返回值用上：有待签账号就 1 分钟后重试。
+	pending := p.runAutoCheckin(ctx)
+	go func() {
+		// 周期不是固定 10 分钟：有「开了自动签到但还没签上」的账号时用短周期重试，
+		// 把等待从 10 分钟压到 1 分钟。
+		//
+		// 为什么需要：`runAutoCheckin` 会跳过 **worker 尚未就绪** 的账号
+		// （`entry.Ready == false`），而服务重启后 worker 要预热几秒~几十秒。
+		// 已经签完的账号不满足 `pending` 条件，于是回到 10 分钟长周期，
+		// 不会一直高频轮询。
+		const idleEvery = 10 * time.Minute
+		const pendingEvery = 1 * time.Minute
+		next := idleEvery
+		if pending {
+			next = pendingEvery
+		}
+		timer := time.NewTimer(next)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				pending = p.runAutoCheckin(ctx)
+				if pending {
+					next = pendingEvery
+				} else {
+					next = idleEvery
+				}
+				timer.Reset(next)
+			}
+		}
+	}()
+}
+
+// runAutoCheckin 跑一轮自动签到，返回**是否还有账号等待签到**
+// （已开启、但今天还没签上）。调用方据此决定下次轮询间隔。
+func (p *Panel) runAutoCheckin(ctx context.Context) bool {
+	return p.runAutoCheckinAt(ctx, time.Now())
+}
+
+// runAutoCheckinAt 是 runAutoCheckin 的可注入时间的版本，便于测试。
+func (p *Panel) runAutoCheckinAt(ctx context.Context, now time.Time) bool {
+	if now.Hour() < p.Cfg.CheckinHourLocal {
+		return false
+	}
+	pending := false
+	today := now.Format("2006-01-02")
+	for _, acct := range p.Store.List() {
+		if !acct.Enabled || !acct.AutoCheckin {
+			continue
+		}
+		// LastCheckinAt 是本地 RFC3339，前 10 字节即本地日期 ——
+		// 直接比这 10 字节就是「今天是否已签」的守卫。
+		// 这个判断要**放在就绪检查之前**：已经签过的账号不该再拉长轮询。
+		if len(acct.LastCheckinAt) >= 10 && acct.LastCheckinAt[:10] == today {
+			continue
+		}
+		// 只有「真的打了一轮上游、拿到明确答复」才算结清。
+		// 下面任何一条 continue（没跑起来 / 没就绪 / 拿不到地址 / 请求出错）
+		// 都意味着这个账号**今天还没签上**，要保住 pending 让调用方稍后重试。
+		//
+		// 注意用独立的 waiting 标记、不能复用 pending：pending 是「所有账号」的
+		// 汇总，一个账号签成功就把它清零，会把**后面还没签的账号**一起漏掉。
+		waiting := false
+		if !p.Manager.Running(acct.ID) {
+			waiting = true
+		} else if entry := p.Pool.Get(acct.ID); entry == nil || !entry.Ready {
+			waiting = true
+		} else if url, ok := p.Manager.URL(acct.ID); !ok {
+			waiting = true
+		} else {
+			cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			result, err := p.Manager.Client(acct.ID).Checkin(cctx, url)
+			cancel()
+			if err != nil {
+				log.Printf("[checkin] %s: %v", acct.ID, err)
+				p.noteCheckin(acct.ID, err.Error())
+				// 出错也可能是暂时性的（网络 / worker 抖动），保持短周期重试。
+				waiting = true
+			} else {
+				msg := summariseCheckin(result)
+				log.Printf("[checkin] %s: %s", acct.ID, msg)
+				p.noteCheckin(acct.ID, msg)
+			}
+		}
+		if waiting {
+			pending = true
+		}
+	}
+	return pending
+}
+
+// summariseCheckin 把 worker 透传的原始签到返回，压成一句可读文案。
+//
+// worker 的返回形如 {"ok":true,"status":"success","message":"签到成功 +100 积分"}
+// （见 worker/src/checkin.mjs 的 status 四种取值）。这里优先用上游给的 message，
+// 缺失时按 status 兜底，避免账号表出现空白。
+func summariseCheckin(raw json.RawMessage) string {
+	var r struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &r); err == nil {
+		if strings.TrimSpace(r.Message) != "" {
+			return r.Message
+		}
+		switch r.Status {
+		case "success":
+			return "签到完成"
+		case "already":
+			return "今日已签到"
+		case "skipped":
+			return "签到活动未开放"
+		}
+	}
+	// 解不出来时退回原文（截断，别把整段 JSON 塞进账号表）。
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		return "签到已尝试"
+	}
+	if len(text) > 120 {
+		text = text[:120] + "…"
+	}
+	return text
+}
+
+// noteCheckin 把签到结果记到账号上，账号表直接展示、不用再跑一次请求。
+func (p *Panel) noteCheckin(id, message string) {
+	if strings.TrimSpace(message) == "" {
+		message = "签到已尝试"
+	}
+	_, _ = p.Store.Update(id, func(a *accounts.Account) {
+		a.LastCheckinAt = time.Now().Format(time.RFC3339)
+		a.LastCheckinMsg = message
+	})
 }
 
 func (p *Panel) cachedQuota(id string) (*worker.Quota, string) {
@@ -386,6 +546,15 @@ func (p *Panel) handleAccountAction(w http.ResponseWriter, r *http.Request, id, 
 		p.managerAction(w, acct, func(ctx context.Context, url string) (any, error) {
 			return p.Manager.Client(acct.ID).Checkin(ctx, url)
 		})
+	case action == "autocheckin/on" || action == "autocheckin/off":
+		// 账号级「自动签到」开关（照 trae-free 的同名动作）。
+		enabled := action == "autocheckin/on"
+		updated, err := p.Store.Update(id, func(a *accounts.Account) { a.AutoCheckin = enabled })
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, updated)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown_action"})
 	}
@@ -580,6 +749,12 @@ func (p *Panel) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 	}
 	if v, ok := body["stats_keep_days"].(float64); ok && v > 0 {
 		updated.StatsKeepDays = int(v)
+	}
+	// 每日自动签到时间（本地小时）。**0 是合法值**（= 过零点就允许自动签到），
+	// 所以只在 0~23 区间内才接受 —— 不能用 `v > 0`，否则用户显式设的 0
+	// 会被当成无效值丢掉、又被兜底逻辑顶回 10。
+	if v, ok := body["checkin_hour_local"].(float64); ok && v >= 0 && v <= 23 {
+		updated.CheckinHourLocal = int(v)
 	}
 	// 上下文窗口：0 是**合法值**（= 不注入，走上游目录默认的 20 万），
 	// 所以不能用 `v > 0` 过滤，否则这个开关永远关不回去。

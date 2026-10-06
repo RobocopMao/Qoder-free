@@ -38,6 +38,18 @@ type Config struct {
 	StatsEnabled  bool `json:"stats_enabled"`
 	StatsKeepDays int  `json:"stats_keep_days"`
 
+	// CheckinHourLocal 是「本地时间过了几点才允许自动签到」的小时数
+	// （0~23，默认 10）。照 trae-free 的同名配置设计。
+	//
+	// **默认取 10 而不是 0**：qoder 的签到活动刷新点不是本地零点。
+	// 上游活动 `act-20260930-100` 的描述原文写着
+	// 「每日 10:00（UTC+8）刷新，领取后 30 天有效」
+	// （en: "Daily reset: 10:00 (UTC+8)"），活动窗口 startAt/endAt 实测为
+	// 10:00 → 次日 09:59。所以 0~9 点签到仍落在**前一天**的周期里，
+	// 那时已经领过、只会返回「今日已签到」而拿不到新积分。
+	// 取 10 才能保证每次自动签到都落在新周期内。
+	CheckinHourLocal int `json:"checkin_hour_local"`
+
 	RequestBodyCapMB int `json:"request_body_cap_mb"` // /v1/chat/completions body cap
 
 	// ContextWindow is the upstream context_length injected when the client did
@@ -66,6 +78,7 @@ func Defaults() Config {
 		SessionTTLSeconds:      1800,
 		StatsEnabled:           true,
 		StatsKeepDays:          30,
+		CheckinHourLocal:       10,
 		RequestBodyCapMB:       32,
 	}
 }
@@ -112,6 +125,7 @@ func applyEnv(cfg *Config) {
 	intv("QF_MAX_RETRY_ACCOUNTS", &cfg.MaxRetryAccounts)
 	intv("QF_MAX_IN_FLIGHT", &cfg.MaxInFlight)
 	intv("QF_COOLDOWN_SOFT_SECONDS", &cfg.CooldownSoftSeconds)
+	intv("QF_CHECKIN_HOUR_LOCAL", &cfg.CheckinHourLocal)
 	intv("QF_COOLDOWN_SOFT_MAX_SECONDS", &cfg.CooldownSoftMaxSeconds)
 	intv("QF_BREAKER_THRESHOLD", &cfg.BreakerThreshold)
 	intv("QF_BREAKER_COOLDOWN_SECONDS", &cfg.BreakerCooldownSeconds)
@@ -160,6 +174,11 @@ func normalize(cfg *Config) {
 	}
 	if cfg.StatsKeepDays <= 0 {
 		cfg.StatsKeepDays = 30
+	}
+	// 0 是**合法值**（表示"过了本地零点就允许"），所以只在越界时才兜底，
+	// 不能用 `<= 0` 判断 —— 那会把用户显式设的 0 顶回 10。
+	if cfg.CheckinHourLocal < 0 || cfg.CheckinHourLocal > 23 {
+		cfg.CheckinHourLocal = 10
 	}
 	if cfg.RequestBodyCapMB <= 0 {
 		cfg.RequestBodyCapMB = 32
