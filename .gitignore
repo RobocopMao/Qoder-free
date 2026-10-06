@@ -4,3 +4,13 @@ bin/
 logs/
 *.exe
 worker/node_modules/
+
+# macOS 杂物（含子目录）
+.DS_Store
+**/.DS_Store
+
+# 构建缓存
+.gocache/
+
+# IDE（JetBrains）
+.idea/

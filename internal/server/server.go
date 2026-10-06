@@ -26,12 +26,12 @@ import (
 )
 
 type Server struct {
-	Cfg      config.Config
-	Store    *accounts.Store
-	Pool     *pool.Pool
-	Manager  *worker.Manager
-	Panel    http.Handler
-	Stats    *stats.Recorder
+	Cfg     config.Config
+	Store   *accounts.Store
+	Pool    *pool.Pool
+	Manager *worker.Manager
+	Panel   http.Handler
+	Stats   *stats.Recorder
 
 	mu          sync.Mutex
 	modelsCache map[string]modelsCacheEntry
@@ -76,10 +76,10 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 // ---- chat ----
 
 type chatMeta struct {
-	Model       string          `json:"model"`
-	Messages    json.RawMessage `json:"messages"`
-	Stream      bool            `json:"stream"`
-	Metadata    json.RawMessage `json:"metadata"`
+	Model    string          `json:"model"`
+	Messages json.RawMessage `json:"messages"`
+	Stream   bool            `json:"stream"`
+	Metadata json.RawMessage `json:"metadata"`
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -167,7 +167,7 @@ func (s *Server) attempt(ctx context.Context, w http.ResponseWriter, acct accoun
 		return attemptRetry
 	}
 	url, _ := s.Manager.URL(acct.ID)
-	payload := buildChatPayload(rawBody, model, stream)
+	payload := buildChatPayload(rawBody, model, stream, s.Cfg.ContextWindow)
 	client := s.Manager.Client(acct.ID)
 	started := time.Now()
 	resp, err := client.Chat(ctx, url, requestID, payload)
@@ -270,7 +270,12 @@ func coalesce(v, def int) int {
 
 // buildChatPayload whitelists OpenAI fields the worker understands, mirroring
 // cli2api's BuildChatPayload: unknown fields are dropped, raw JSON preserved.
-func buildChatPayload(raw []byte, model string, stream bool) []byte {
+//
+// defaultContext is injected as `context_length` **only** when the client did
+// not send one: the qoder catalog advertises [200000, 400000, 1000000] but
+// defaults to 200000, so without this the 1M window is unreachable ("只有几百k，
+// 现在不能调节"). A client-supplied context_length always wins.
+func buildChatPayload(raw []byte, model string, stream bool, defaultContext int) []byte {
 	var in struct {
 		Messages              json.RawMessage `json:"messages"`
 		MaxTokens             json.RawMessage `json:"max_tokens"`
@@ -288,6 +293,7 @@ func buildChatPayload(raw []byte, model string, stream bool) []byte {
 		Thinking              json.RawMessage `json:"thinking"`
 		ReasoningEffort       json.RawMessage `json:"reasoning_effort"`
 		ReasoningBudgetTokens json.RawMessage `json:"reasoning_budget_tokens"`
+		ContextLength         json.RawMessage `json:"context_length"`
 	}
 	_ = json.Unmarshal(raw, &in)
 	payload := map[string]any{
@@ -325,6 +331,13 @@ func buildChatPayload(raw []byte, model string, stream bool) []byte {
 	}
 	if in.EnableReasoning != nil {
 		payload["enable_reasoning"] = *in.EnableReasoning
+	}
+	if len(in.ContextLength) > 0 {
+		// 客户端显式指定的一律透传，优先级最高。
+		payload["context_length"] = json.RawMessage(in.ContextLength)
+	} else if defaultContext > 0 {
+		// 客户端没指定才注入服务端配置值（设置页可调）。
+		payload["context_length"] = defaultContext
 	}
 	out, err := json.Marshal(payload)
 	if err != nil {
@@ -543,9 +556,9 @@ func (s *Server) accountModels(ctx context.Context, acct accounts.Account) []wor
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	healthy, total := s.Pool.Counts()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"healthy":  healthy,
-		"total":    total,
-		"service":  "qoder-free",
+		"healthy": healthy,
+		"total":   total,
+		"service": "qoder-free",
 	})
 }
 

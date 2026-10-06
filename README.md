@@ -62,7 +62,13 @@
 | `breaker_threshold` | `3` | 连续失败触发熔断次数 |
 | `session_sticky` | `true` | 会话粘性（TTL `session_ttl_seconds`） |
 | `stats_enabled` | `true` | 按天 token 统计（`data/stats.json`） |
+| `context_window` | `0` | 客户端没带 `context_length` 时注入给上游的窗口。`0` = 不注入，走上游目录默认（**20 万**）。上游目录给的是 `[200000, 400000, 1000000]`，想要 1M 就在这里填 `1000000`（或面板「设置」里选）。客户端自己带了 `context_length` 的一律以客户端为准 |
 | `proxy_url` | 空 | 传给 worker 的上游代理 |
+
+> `context_window` 存在的意义：qoder 的模型目录虽然声明支持 1M，但 `default_context_window` 只有 `200000`，
+> 而 `internal/server/server.go` 的 `buildChatPayload` 是白名单重建，**不认识的字段会被丢掉**——
+> 所以在加这个键之前，无论客户端怎么传都只能吃 20 万（用户 2026-10-02 反馈：「支持1M，但现在只有几百k，不能调节」）。
+> 现在客户端没指定时由服务端注入，客户端指定时透传。
 
 ## 目录结构
 
@@ -79,6 +85,27 @@ internal/panel/      内嵌管理面板（go:embed index.html + app.js）
 worker/              每账号 Node daemon（自 cli2api 提取，含 compat 钉版）
 data/homes/<id>/     账号 HOME：凭证与 qodercli 状态都在 .qoder[-cn] 内
 ```
+
+## SSE 直通的硬约束（别踩）
+
+`internal/relay/` 把上游字节**原样转发**，只旁路解析 `data:` 行来抓 usage 与流中错误。
+**绝不能把上游空行吃掉再自己拼 `data: ...\n`**：SSE 的帧边界就是这个空行
+（`text/event-stream` 规范），下游解析器都按 `\n\n` 切帧。少写一个空行，
+整条流会被粘成一大块，标准解析器只能切出 1 个事件 —— 在 DSH / billion-context
+这类带代理的客户端上表现为整轮失败：
+
+```
+upstream stream ended before a completion event; this turn may be incomplete
+```
+
+同样地，**`internal/worker` 的 chat 客户端不能设 `http.Client.Timeout`**：
+那个上限把**响应体读取**也算进去，会把一条还在正常吐字的长流腰斩
+（大上下文 + 深度思考很容易跑过任何固定秒数），而且是被静默掐断 ——
+下游看到的仍是「流凭空结束」，同一条报错。正确做法是只设
+`Transport.ResponseHeaderTimeout`（封顶「迟迟不返回响应头」），
+JSON RPC 那类短调用才继续用整体 `Timeout`。见 `Manager.chatHeaderWait`。
+
+（`internal/relay/relay_test.go` 与 `internal/worker/client_test.go` 守着这两条。）
 
 ## 凭证说明
 

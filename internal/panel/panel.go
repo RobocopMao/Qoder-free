@@ -249,6 +249,9 @@ func (p *Panel) route(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"api_key": p.Cfg.APIKey})
 	case len(parts) == 1 && r.Method == http.MethodPost:
 		p.handleAccountAction(w, r, parts[0], "")
+	case len(parts) == 4 && parts[0] == "accounts" && r.Method == http.MethodPost:
+		// Sub-actions such as login/start and login/poll.
+		p.handleAccountAction(w, r, parts[1], parts[2]+"/"+parts[3])
 	case len(parts) == 3 && parts[0] == "accounts" && r.Method == http.MethodPost:
 		p.handleAccountAction(w, r, parts[1], parts[2])
 	case len(parts) == 3 && parts[0] == "accounts" && r.Method == http.MethodGet:
@@ -577,6 +580,11 @@ func (p *Panel) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 	}
 	if v, ok := body["stats_keep_days"].(float64); ok && v > 0 {
 		updated.StatsKeepDays = int(v)
+	}
+	// 上下文窗口：0 是**合法值**（= 不注入，走上游目录默认的 20 万），
+	// 所以不能用 `v > 0` 过滤，否则这个开关永远关不回去。
+	if v, ok := body["context_window"].(float64); ok && v >= 0 {
+		updated.ContextWindow = int(v)
 	}
 	// api_key / listen are server-managed: shown read-only, edits go through config.json + restart.
 	if err := config.Save(p.CfgPath, updated); err != nil {

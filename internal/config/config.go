@@ -13,16 +13,16 @@ import (
 )
 
 type Config struct {
-	Listen        string `json:"listen"`          // e.g. 127.0.0.1:8210
-	APIKey        string `json:"api_key"`         // Bearer key for /v1/* and /panel/api/*; empty generated on first boot
-	DataDir       string `json:"data_dir"`        // accounts, homes, state, stats
-	WorkerBasePort int   `json:"worker_base_port"` // first port for per-account workers
-	NodeBinary    string `json:"node_binary"`     // node executable
-	WorkerDaemon  string `json:"worker_daemon"`   // path to worker/src/daemon.mjs
-	QoderCLIJS    string `json:"qoder_cli_js"`    // global bundle qodercli.js
-	QoderCNCLIJS  string `json:"qoder_cn_cli_js"` // cn bundle qoderclicn.js
-	PlainTemplate string `json:"plain_template"`  // worker/last-plain.sample.json
-	ProxyURL      string `json:"proxy_url"`       // optional upstream proxy passed to workers
+	Listen         string `json:"listen"`           // e.g. 127.0.0.1:8210
+	APIKey         string `json:"api_key"`          // Bearer key for /v1/* and /panel/api/*; empty generated on first boot
+	DataDir        string `json:"data_dir"`         // accounts, homes, state, stats
+	WorkerBasePort int    `json:"worker_base_port"` // first port for per-account workers
+	NodeBinary     string `json:"node_binary"`      // node executable
+	WorkerDaemon   string `json:"worker_daemon"`    // path to worker/src/daemon.mjs
+	QoderCLIJS     string `json:"qoder_cli_js"`     // global bundle qodercli.js
+	QoderCNCLIJS   string `json:"qoder_cn_cli_js"`  // cn bundle qoderclicn.js
+	PlainTemplate  string `json:"plain_template"`   // worker/last-plain.sample.json
+	ProxyURL       string `json:"proxy_url"`        // optional upstream proxy passed to workers
 
 	MaxRetryAccounts int `json:"max_retry_accounts"` // rotate attempts per chat request
 	MaxInFlight      int `json:"max_in_flight"`      // default per-account concurrency
@@ -32,13 +32,20 @@ type Config struct {
 	BreakerThreshold       int `json:"breaker_threshold"`         // consecutive failures before breaker
 	BreakerCooldownSeconds int `json:"breaker_cooldown_seconds"`
 
-	SessionSticky    bool `json:"session_sticky"`     // bind conversation to one account
-	SessionTTLSeconds int `json:"session_ttl_seconds"`
+	SessionSticky     bool `json:"session_sticky"` // bind conversation to one account
+	SessionTTLSeconds int  `json:"session_ttl_seconds"`
 
 	StatsEnabled  bool `json:"stats_enabled"`
 	StatsKeepDays int  `json:"stats_keep_days"`
 
 	RequestBodyCapMB int `json:"request_body_cap_mb"` // /v1/chat/completions body cap
+
+	// ContextWindow is the upstream context_length injected when the client did
+	// not send one. 0 = leave it to the upstream/catalog default (200000), which
+	// is why qoderfree used to be stuck at "a few hundred k" even though the
+	// catalog advertises [200000, 400000, 1000000]. A per-request
+	// `context_length` always wins.
+	ContextWindow int `json:"context_window"`
 }
 
 func Defaults() Config {
@@ -109,6 +116,7 @@ func applyEnv(cfg *Config) {
 	intv("QF_BREAKER_THRESHOLD", &cfg.BreakerThreshold)
 	intv("QF_BREAKER_COOLDOWN_SECONDS", &cfg.BreakerCooldownSeconds)
 	intv("QF_SESSION_TTL_SECONDS", &cfg.SessionTTLSeconds)
+	intv("QF_CONTEXT_WINDOW", &cfg.ContextWindow)
 	if v := strings.TrimSpace(os.Getenv("QF_SESSION_STICKY")); v != "" {
 		cfg.SessionSticky = v == "1" || strings.EqualFold(v, "true")
 	}
@@ -155,6 +163,12 @@ func normalize(cfg *Config) {
 	}
 	if cfg.RequestBodyCapMB <= 0 {
 		cfg.RequestBodyCapMB = 32
+	}
+	// 0 is meaningful here (= don't inject, use the catalog default), so only
+	// reject nonsense values; anything below the catalog floor is treated as
+	// "unset" rather than silently asking upstream for an impossible window.
+	if cfg.ContextWindow != 0 && cfg.ContextWindow < 1000 {
+		cfg.ContextWindow = 0
 	}
 	if cfg.WorkerBasePort <= 0 {
 		cfg.WorkerBasePort = 33100

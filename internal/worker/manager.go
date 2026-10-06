@@ -34,10 +34,10 @@ type Process struct {
 }
 
 type Manager struct {
-	mu       sync.Mutex
-	procs    map[string]*Process
-	ports    map[int]string // port -> accountID
-	logSink  io.Writer
+	mu      sync.Mutex
+	procs   map[string]*Process
+	ports   map[int]string // port -> accountID
+	logSink io.Writer
 
 	NodeBinary    string
 	DaemonPath    string
@@ -49,15 +49,27 @@ type Manager struct {
 	BasePort      int
 	MaxLogBytes   int
 
-	client *http.Client
+	client     *http.Client // JSON RPC：整体封顶，短调用
+	chatClient *http.Client // chat：只封顶「等响应头」，不封顶响应体
 }
 
+// chatHeaderWait 是 Go→worker chat 允许「迟迟不返回响应头」的上限。
+// 注意这里**不能**用 http.Client.Timeout：那个上限会把正在流式输出的
+// 响应体一起掐断（大上下文 + 深度思考的回复很容易超过任何固定秒数），
+// 而下游只会看到流凭空结束 —— 表现就是 DSH 报
+// 「upstream stream ended before a completion event」，且不可重试、不可读。
+const chatHeaderWait = 130 * time.Second
+
 func NewManager(logSink io.Writer) *Manager {
+	chatTransport := http.DefaultTransport.(*http.Transport).Clone()
+	chatTransport.ResponseHeaderTimeout = chatHeaderWait
 	return &Manager{
 		procs:   map[string]*Process{},
 		ports:   map[int]string{},
 		logSink: logSink,
 		client:  &http.Client{Timeout: 130 * time.Second},
+		// Clone() 保留 ProxyFromEnvironment，行为与原默认 Transport 一致。
+		chatClient: &http.Client{Transport: chatTransport},
 	}
 }
 

@@ -79,9 +79,35 @@ async function machineHeaders(auth) {
     }
   }
   if (typeof machineId !== "string" || !machineId) return {};
+
+  // **`Cosy-MachineToken` 必须是 UMID 机器令牌，不是 machineId**（用户 m00303）。
+  //
+  // 原来这里两行都填 machineId，是错的。CLI 自己的实现（qoderclicn.js 的
+  // `buildHeaders`）写得很明确：
+  //     let a = _T(); await a.initialize(uid); let l = a.getMachineToken();
+  //     if (!l) throw new Error("Dynamic command request requires a UMID machine token");
+  //     uWo(o, "Cosy-MachineToken", l)
+  // 拿不到 UMID 令牌时 CLI 直接抛错 —— 说明上游会校验它。
+  //
+  // 我们原来拿 machineId 顶替，上游不认，于是签到恒返回
+  // 「签到活动未开放」（其实是鉴权不通过）。
+  //
+  // 令牌由 `compat.mjs` 新注入的 `__qoderWorkerGetMachineToken()` 提供
+  // （挂在 CLI 的 `_T()` 单例工厂上，内部会先 await initialize()）。
+  let machineToken = "";
+  try {
+    if (typeof globalThis.__qoderWorkerGetMachineToken === "function") {
+      machineToken = String((await globalThis.__qoderWorkerGetMachineToken()) || "");
+    }
+  } catch {
+    machineToken = "";
+  }
+
   return {
     "Cosy-MachineId": machineId,
-    "Cosy-MachineToken": machineId,
+    // 拿不到 UMID 令牌时**不填**（而不是拿 machineId 冒充）：
+    // 冒充只会让上游返回语义含糊的"活动未开放"，掩盖真实的鉴权失败。
+    ...(machineToken ? { "Cosy-MachineToken": machineToken } : {}),
   };
 }
 

@@ -398,8 +398,27 @@ function renderChart(series) {
     const cls = (d.requests || 0) === 0 ? "r zero" : "r";
     return `<div class="${cls}" style="--r:${r}%"></div>`;
   }).join("");
-  scale.innerHTML = series.map((d) => `<span title="${esc(d.day)}">${esc(d.day.slice(5))}</span>`).join("");
+  scale.innerHTML = series.map((d) => `<span title="${esc(d.day)}">${esc(pointLabel(d.day))}</span>`).join("");
   $("chartReadout").textContent = series.length ? "— 悬停查看明细" : "暂无数据";
+  // 今日档服务端给的是逐小时序列（`2026-10-02T14`），单位说明跟着走，否则会一直写着「按自然日」。
+  $("chartUnit").textContent = statRange === "today" ? "按小时" : "按自然日";
+}
+
+/* 横轴刻度文案：小时桶 `2026-10-02T14` → `14:00`；天桶 `2026-10-02` → `10-02`。
+   直接 slice(5) 会把小时桶切成 `10-02T14` 这种夹生串。 */
+function pointLabel(key) {
+  if (typeof key === "string" && key.length >= 13 && key[10] === "T") {
+    return key.slice(11, 13) + ":00";
+  }
+  return typeof key === "string" ? key.slice(5) : key;
+}
+
+/* 悬停读数的标题：小时桶 `2026-10-02T14` → `2026-10-02 14:00`；天桶原样。 */
+function pointTitle(key) {
+  if (typeof key === "string" && key.length >= 13 && key[10] === "T") {
+    return key.slice(0, 10) + " " + key.slice(11, 13) + ":00";
+  }
+  return key;
 }
 $("chartPlot").addEventListener("mouseover", (ev) => {
   const col = ev.target.closest(".col");
@@ -410,7 +429,7 @@ $("chartPlot").addEventListener("mouseover", (ev) => {
   col.classList.add("on");
   const total = (d.prompt_tokens || 0) + (d.completion_tokens || 0);
   $("chartReadout").innerHTML =
-    `<b>${esc(d.day)}</b> · ${fmtTok(total)} tok · ${d.requests} 次` + (d.failures ? ` · <span class="bad">失败 ${d.failures}</span>` : "");
+    `<b>${esc(pointTitle(d.day))}</b> · ${fmtTok(total)} tok · ${d.requests} 次` + (d.failures ? ` · <span class="bad">失败 ${d.failures}</span>` : "");
 });
 $("chartPlot").addEventListener("mouseleave", () => {
   document.querySelectorAll("#chartPlot .col.on").forEach((c) => c.classList.remove("on"));
@@ -455,6 +474,8 @@ async function loadConfig() {
     form.session_sticky.checked = !!cfg.session_sticky;
     form.stats_enabled.checked = !!cfg.stats_enabled;
     form.stats_keep_days.value = cfg.stats_keep_days || 30;
+    // 0 是合法值（= 走上游目录默认），不能写成 `|| 0` 之外的花样
+    form.context_window.value = String(cfg.context_window ?? 0);
     form.proxy_url.value = cfg.proxy_url || "";
     $("cfgNote").textContent = "";
   } catch (e) {
@@ -485,6 +506,7 @@ $("cfgForm").addEventListener("submit", async (ev) => {
         session_sticky: form.session_sticky.checked,
         stats_enabled: form.stats_enabled.checked,
         stats_keep_days: +form.stats_keep_days.value,
+        context_window: +form.context_window.value,
         proxy_url: form.proxy_url.value.trim(),
       }),
     });

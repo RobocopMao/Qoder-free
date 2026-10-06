@@ -92,11 +92,11 @@ func (m ModelEntry) CreditsLabel() string {
 
 // Quota mirrors GET /admin/quota {quota: {...}}.
 type Quota struct {
-	UserQuota      *QuotaBlock `json:"userQuota"`
-	AddOnQuota     *QuotaBlock `json:"addOnQuota"`
-	OrgPackage     *QuotaBlock `json:"orgResourcePackage"`
-	IsQuotaExceeded bool       `json:"isQuotaExceeded"`
-	FetchedAt      string      `json:"fetchedAt"`
+	UserQuota       *QuotaBlock `json:"userQuota"`
+	AddOnQuota      *QuotaBlock `json:"addOnQuota"`
+	OrgPackage      *QuotaBlock `json:"orgResourcePackage"`
+	IsQuotaExceeded bool        `json:"isQuotaExceeded"`
+	FetchedAt       string      `json:"fetchedAt"`
 }
 
 type QuotaBlock struct {
@@ -167,13 +167,16 @@ func (e *WorkerError) Error() string {
 
 // Client speaks the worker HTTP contract for one account at a time.
 type Client struct {
-	HTTP      *http.Client
+	HTTP *http.Client
+	// ChatHTTP 专供 Chat 使用：只封顶响应头、不封顶响应体。
+	// 复用 HTTP 会把流式回复一起掐掉，见 Manager.chatHeaderWait。
+	ChatHTTP  *http.Client
 	APIKey    string
 	AccountID string
 }
 
 func (m *Manager) Client(accountID string) Client {
-	return Client{HTTP: m.client, APIKey: m.APIKey, AccountID: accountID}
+	return Client{HTTP: m.client, ChatHTTP: m.chatClient, APIKey: m.APIKey, AccountID: accountID}
 }
 
 func (c Client) do(ctx context.Context, method, url string, body []byte, contentType string) (*http.Response, error) {
@@ -332,7 +335,12 @@ func (c Client) Chat(ctx context.Context, url, requestID string, payload []byte)
 	if requestID != "" {
 		req.Header.Set("X-Request-Id", requestID)
 	}
-	resp, err := c.HTTP.Do(req)
+	// 流式回复的总时长由「上游还在不在吐字节」决定，不能用整体 Timeout 封顶。
+	httpClient := c.ChatHTTP
+	if httpClient == nil {
+		httpClient = c.HTTP
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, &WorkerError{Kind: ErrKindTransport, Message: err.Error()}
 	}
