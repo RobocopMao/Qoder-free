@@ -1,5 +1,18 @@
+// 各 region 的 openapi 端点。**cn 与国际版是两套域名**：
+//   cn     → openapi.qoder.com.cn（网页 qoder.com.cn）
+//   global → openapi.qoder.sh    （网页 qoder.sh）
+//
+// 用户 m00305：「qoder 国际版不能签到吗？」
+// —— 之前这里**只有 cn**，国际版账号会直接抛 `qoder_checkin_region_unsupported`。
+//
+// 实证国际版上游是支持的：国际版 CLI（@qoder-ai/qodercli）里签到相关代码
+// 与 CN 版**逐项一致** —— `/sash/api/v1/me/campaigns`(1)、`getMachineToken`(3)、
+// `claimActivity`(8)、`requiresCanClaim`(13)、`claimDisplay`(7) 计数完全相同，
+// 端点表里 `openapi` 就是 `openapi.qoder.sh`。路径也同一条。
+// 所以只是我们漏配了域名，不是上游不支持。
 const endpoints = {
   cn: { base: "https://openapi.qoder.com.cn", origin: "https://qoder.com.cn" },
+  global: { base: "https://openapi.qoder.sh", origin: "https://qoder.sh" },
 };
 const campaignsPath = "/sash/api/v1/me/campaigns";
 const maxResponseBytes = 65536;
