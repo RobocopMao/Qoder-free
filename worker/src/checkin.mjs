@@ -82,7 +82,76 @@ function rewardFrom(campaign) {
   return benefit.amount;
 }
 
-async function machineHeaders(auth) {
+// 从 Qoder 桌面 App 自带的**原生 UMID 二进制**取机器身份。
+//
+// 为什么需要（用户 m00312：「国际版签到积分没变」，实测根因）：
+// 同一个账号、同样的请求头，只换 `Cosy-MachineToken` 的来源，
+// 上游 `/sash/api/v1/me/campaigns` 返回的活动列表**完全不同**：
+//
+//   用 CLI 的 `_T().getMachineToken()` → 只有 VIEW_DETAILS，没有签到活动
+//   用 App 原生二进制的 machineToken  → 出现 act-20260930-314
+//                                       CLAIM_BENEFIT / CLAIMABLE（+100 Credits）
+//
+// 两个令牌都是 88 位、都以 `P1gA` 开头，但内容不同：CLI 的 `doInitialize()`
+// 会 `extractBinary()` 出它**自己那份** umid 二进制，与 App 内的
+// `Resources/umid/runtime-info` 不是同一个。上游按该令牌判定活动资格。
+//
+// 二进制输出（实测）：
+//   {"machineToken":"P1gA...","machineType":"6448...","machineCode":"1a67...","vmInfo":{...}}
+// machineCode / machineType 也要作为 `Cosy-MachineCode` / `Cosy-MachineType`
+// 发给上游 —— App 的请求头构造函数 `YBr()` 就带这两个。
+//
+// 读不到就返回 null，调用方回落到 CLI 令牌：不能因为用户没装桌面 App
+// 就让签到彻底不可用。
+let nativeIdentityCache; // undefined=未取过 / null=取不到 / {token,code,type,at}
+// 缓存有效期取 1 小时，与 CLI 的刷新周期一致：
+// CLI 的 `scheduleNextRefresh()` 用 `y4a=36e5`（=3600s）加 ±5min 抖动重取令牌。
+// 令牌虽然实测在多次调用间稳定，但**不能永久缓存** —— 上游可能做时效/防重放校验，
+// 缓存过久会导致签到在跑了一段时间后莫名失败。1 小时足够省掉重复起进程的开销
+// （二进制启动约 1s），又与 CLI 行为对齐。
+const nativeIdentityTTLMs = 3600 * 1000;
+
+async function nativeMachineIdentity(region) {
+  const now = Date.now();
+  if (nativeIdentityCache && nativeIdentityCache.at && now - nativeIdentityCache.at < nativeIdentityTTLMs) {
+    return nativeIdentityCache;
+  }
+  if (nativeIdentityCache === null) return null;
+  try {
+    const { execFileSync } = await import("node:child_process");
+    const { existsSync } = await import("node:fs");
+    // 国际版与国内版是两个 App，优先按 region 选，另一个作兜底。
+    const candidates = region === "cn"
+      ? ["/Applications/Qoder CN.app/Contents/Resources/umid/runtime-info",
+         "/Applications/Qoder.app/Contents/Resources/umid/runtime-info"]
+      : ["/Applications/Qoder.app/Contents/Resources/umid/runtime-info",
+         "/Applications/Qoder CN.app/Contents/Resources/umid/runtime-info"];
+    for (const bin of candidates) {
+      if (!existsSync(bin)) continue;
+      try {
+        const out = execFileSync(bin, [], { timeout: 15000, encoding: "utf8" });
+        const parsed = JSON.parse(String(out).trim());
+        const token = typeof parsed.machineToken === "string" ? parsed.machineToken.trim() : "";
+        if (!token) continue;
+        nativeIdentityCache = {
+          token,
+          code: typeof parsed.machineCode === "string" ? parsed.machineCode.trim() : "",
+          type: typeof parsed.machineType === "string" ? parsed.machineType.trim() : "",
+          at: Date.now(),
+        };
+        return nativeIdentityCache;
+      } catch {
+        // 换下一个候选
+      }
+    }
+  } catch {
+    // 忽略：回落到 CLI 令牌
+  }
+  nativeIdentityCache = null;
+  return null;
+}
+
+async function machineHeaders(auth, region = "cn") {
   let machineId = auth.machineId;
   if (typeof auth.getMachineId === "function") {
     try {
@@ -116,11 +185,23 @@ async function machineHeaders(auth) {
     machineToken = "";
   }
 
+  // **优先用桌面 App 原生二进制的令牌**（用户 m00312 的根因修复）。
+  //
+  // 只换令牌来源、其余请求头完全一致时，上游返回的活动列表不同：
+  //   CLI 令牌    → 只有 VIEW_DETAILS（看不到签到活动，签到恒 skipped）
+  //   原生令牌    → 含 CLAIM_BENEFIT / CLAIMABLE（能真正签到 +100）
+  // 所以能用原生令牌就用，取不到才回落到 CLI 令牌。
+  const native = await nativeMachineIdentity(region);
+  const effectiveToken = native?.token || machineToken;
+
   return {
     "Cosy-MachineId": machineId,
     // 拿不到 UMID 令牌时**不填**（而不是拿 machineId 冒充）：
     // 冒充只会让上游返回语义含糊的"活动未开放"，掩盖真实的鉴权失败。
-    ...(machineToken ? { "Cosy-MachineToken": machineToken } : {}),
+    ...(effectiveToken ? { "Cosy-MachineToken": effectiveToken } : {}),
+    // machineCode / machineType 与令牌同源，App 也会带这两个头。
+    ...(native?.code ? { "Cosy-MachineCode": native.code } : {}),
+    ...(native?.type ? { "Cosy-MachineType": native.type } : {}),
   };
 }
 
@@ -140,7 +221,7 @@ export function createQoderCheckin({ region, getAuthManager, fetchImpl = (...arg
     } catch {
       throw new Error("qoder_checkin_auth_refresh_failed");
     }
-    const machineHeadersValue = await machineHeaders(auth);
+    const machineHeadersValue = await machineHeaders(auth, region);
 
     async function request(path, method, refreshed = false) {
       const user = auth.getUserInfo();
@@ -239,9 +320,9 @@ export function createQoderCheckin({ region, getAuthManager, fetchImpl = (...arg
       ...(hasReward ? { reward_credits: reward } : {}),
     };
   }
-
-  return function checkin() {
+  const fn = function checkin() {
     if (!pending) pending = execute().finally(() => { pending = undefined; });
     return pending;
   };
+  return fn;
 }
