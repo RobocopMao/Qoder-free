@@ -92,6 +92,7 @@ func (p *Panel) StartQuotaLoop(ctx context.Context) {
 					p.quotaCache[acct.ID] = quota
 					p.quotaAt[acct.ID] = time.Now()
 					p.quotaMu.Unlock()
+					p.recordCredits(acct.ID, quota)
 				}
 			}
 		}
@@ -314,6 +315,25 @@ func (p *Panel) cachedQuota(id string) (*worker.Quota, string) {
 	p.quotaMu.Lock()
 	defer p.quotaMu.Unlock()
 	return p.quotaCache[id], p.quotaAt[id].Format("15:04:05")
+}
+
+// recordCredits 把一次额度观测喂给统计记录器（积分趋势图的唯一数据源）。
+//
+// 单独抽出来是因为**取余额与写统计是两件事**：写缓存要拿 quotaMu，
+// 而 Stats.AddCredits 自己要落盘（几十毫秒），在锁里做会拖住 overview，
+// 所以两个调用点都在**释放 quotaMu 之后**才调它。
+//
+// `ok=false`（一个桶都没统计到，worker 刚启动还没热）时直接丢弃：
+// 那不是"余额为 0"，而是"还不知道"，记进去会让曲线凭空掉到地板。
+func (p *Panel) recordCredits(id string, quota *worker.Quota) {
+	if p.Stats == nil || quota == nil {
+		return
+	}
+	total, remaining, ok := quota.Remaining()
+	if !ok {
+		return
+	}
+	p.Stats.AddCredits(id, remaining, total)
 }
 
 // Logs returns the io.Writer the app mirrors its log output into.
@@ -635,6 +655,7 @@ func (p *Panel) handleAccountGet(w http.ResponseWriter, r *http.Request, id, res
 				p.quotaCache[acct.ID] = quota
 				p.quotaAt[acct.ID] = time.Now()
 				p.quotaMu.Unlock()
+				p.recordCredits(acct.ID, quota)
 			}
 			return quota, err
 		})
