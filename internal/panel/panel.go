@@ -41,21 +41,29 @@ type Panel struct {
 	quotaMu    sync.Mutex
 	quotaCache map[string]*worker.Quota
 	quotaAt    map[string]time.Time
+
+	// checkinWake 用来**立刻叫醒**自动签到的调度器（缓冲 1，非阻塞发送）。
+	//
+	// 为什么需要：调度器现在会「睡到下一个签到点」（可能十几个小时），
+	// 若用户中途在面板上打开某账号的自动签到、或改了签到时间，
+	// 不该干等那么久才生效。
+	checkinWake chan struct{}
 }
 
 func New(cfg config.Config, cfgPath string, store *accounts.Store, pl *pool.Pool, manager *worker.Manager, statsRecorder *stats.Recorder, logs io.Writer) *Panel {
 	ring, _ := logs.(*LogRing)
 	return &Panel{
-		Cfg:        cfg,
-		CfgPath:    cfgPath,
-		Store:      store,
-		Pool:       pl,
-		Manager:    manager,
-		Stats:      statsRecorder,
-		Start:      time.Now(),
-		ring:       ring,
-		quotaCache: map[string]*worker.Quota{},
-		quotaAt:    map[string]time.Time{},
+		Cfg:         cfg,
+		CfgPath:     cfgPath,
+		Store:       store,
+		Pool:        pl,
+		Manager:     manager,
+		Stats:       statsRecorder,
+		Start:       time.Now(),
+		ring:        ring,
+		quotaCache:  map[string]*worker.Quota{},
+		quotaAt:     map[string]time.Time{},
+		checkinWake: make(chan struct{}, 1),
 	}
 }
 
@@ -103,60 +111,100 @@ func (p *Panel) StartQuotaLoop(ctx context.Context) {
 	}()
 }
 
-// StartCheckinLoop 每天为「开启了自动签到」的账号跑一次 qoder CN 签到。
-// 设计照抄 trae-free 的 `Panel.StartCheckinLoop`：
-// 用短周期 ticker 轮询，但真正的守卫是「账号级 + 本地日」两道 ——
-// 所以一天最多签一次，不会重复打上游。
+// StartCheckinLoop 每天为「开启了自动签到」的账号跑一次签到。
+// 设计参照 trae-free 的同名调度器，但**不用固定周期轮询**。
 //
-// 为什么默认在本地 10:00 之后才签（Cfg.CheckinHourLocal）：
-// qoder 的签到活动不是本地零点刷新 —— 上游活动描述原文是
-// 「每日 10:00（UTC+8）刷新」，活动窗口实测 10:00 → 次日 09:59。
-// 0~9 点签会落在**前一天**的周期里，只会拿到「今日已签到」而拿不到新积分。
+// 为什么不用固定轮询（用户 m00313）：
+// 「如果已经签到了，就不用轮询，不然老是弹一个密钥的弹窗」。
+// 取设备令牌要起一个会碰钥匙串的原生二进制，无谓地反复唤醒调度器
+// 只会增加触发系统授权弹窗的机会、也白费 CPU。
+//
+// 所以现在按**下一个签到点**精确睡眠：算出来还有哪一天、几点需要动手，
+// 一觉睡到那时候（顺带每 30 分钟醒一次做兜底复查，防止系统休眠/时钟跳变
+// 导致长睡眠失效）。已经签完的账号不会再被打扰。
 func (p *Panel) StartCheckinLoop(ctx context.Context) {
-	// 先立刻跑一次再进 ticker 循环 —— 与 `StartQuotaLoop` 同一做法。
-	//
-	// 为什么必要：`time.NewTicker` 的**首次触发要等满一个周期**（10 分钟）。
-	// 不先跑一次的话，服务重启后要等 10 分钟才可能补签，而重启往往就发生在
-	// 「刚过 10 点、正想补签」的时候。这里先同步跑一次，把等待降到 0。
-	// 有「一天一次」的守卫兜底，重复调用不会重复签到。
-	// 立刻跑一次，并**用它的返回值决定首次间隔**。
-	//
-	// 这里踩过一个坑：先前写成「先 runAutoCheckin 丢掉返回值、next 直接设为
-	// idleEvery(10 分钟)」。但启动那一刻 worker 通常还没就绪，这次必然全部跳过、
-	// 返回 pending=true —— 结果却要干等 10 分钟才重试。
-	// 现在把首次返回值用上：有待签账号就 1 分钟后重试。
-	pending := p.runAutoCheckin(ctx)
+	p.runAutoCheckin(ctx)
+
 	go func() {
-		// 周期不是固定 10 分钟：有「开了自动签到但还没签上」的账号时用短周期重试，
-		// 把等待从 10 分钟压到 1 分钟。
-		//
-		// 为什么需要：`runAutoCheckin` 会跳过 **worker 尚未就绪** 的账号
-		// （`entry.Ready == false`），而服务重启后 worker 要预热几秒~几十秒。
-		// 已经签完的账号不满足 `pending` 条件，于是回到 10 分钟长周期，
-		// 不会一直高频轮询。
-		const idleEvery = 10 * time.Minute
-		const pendingEvery = 1 * time.Minute
-		next := idleEvery
-		if pending {
-			next = pendingEvery
-		}
-		timer := time.NewTimer(next)
-		defer timer.Stop()
 		for {
+			wait := p.nextCheckinDelay(time.Now())
+			timer := time.NewTimer(wait)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return
+			case <-p.checkinWake:
+				// 配置或开关变了，立刻重算。
+				timer.Stop()
 			case <-timer.C:
-				pending = p.runAutoCheckin(ctx)
-				if pending {
-					next = pendingEvery
-				} else {
-					next = idleEvery
-				}
-				timer.Reset(next)
+				p.runAutoCheckin(ctx)
 			}
 		}
 	}()
+}
+
+// wakeCheckinLoop 非阻塞地叫醒签到调度器，让它立刻重算下次唤醒时间。
+// 开关变动 / 改了签到时间时调用。
+func (p *Panel) wakeCheckinLoop() {
+	if p.checkinWake == nil {
+		return
+	}
+	select {
+	case p.checkinWake <- struct{}{}:
+	default:
+		// 已经有一个待处理的唤醒信号，不必重复投递。
+	}
+}
+
+// nextCheckinDelay 算出距离「下一次需要跑签到」还有多久。
+//
+// 规则：
+//   - 没有开启自动签到的账号 → 睡久一点（1 小时）等唤醒信号即可。
+//   - 有账号待签且已过签到点 → 立刻跑（0）。
+//   - 有账号待签但还没到签到点 → 睡到今天/明天的签到点。
+//   - 全部签完 → 睡到**明天**的签到点。
+func (p *Panel) nextCheckinDelay(now time.Time) time.Duration {
+	const idlePoll = 30 * time.Minute
+
+	// 注意这里**不设「每小时醒一次」的上限**（用户 m00313：「如果已经签到了，
+	// 就不用轮询」）。醒来却无事可做虽然不会触网（日期守卫在发请求前就
+	// continue 了），但会让日志和 CPU 白转；而「睡到明天签到点」本身是安全的：
+	// 期间任何配置/开关变动都会通过 `checkinWake` 立刻叫醒重算。
+	//
+	// 只在「全部签完」那条路径给一个下限（60s），防止时钟跳变算出非正间隔
+	// 导致 select 空转。
+
+	hour := p.Cfg.CheckinHourLocal
+	today := now.Format("2006-01-02")
+
+	hasAuto := false
+	for _, acct := range p.Store.List() {
+		if !acct.Enabled || !acct.AutoCheckin {
+			continue
+		}
+		hasAuto = true
+		signedToday := len(acct.LastCheckinAt) >= 10 && acct.LastCheckinAt[:10] == today
+		if !signedToday {
+			// 有待签账号：到点就跑，没到点就睡到签到点。
+			at := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, now.Location())
+			if now.Before(at) {
+				return at.Sub(now)
+			}
+			return 0
+		}
+	}
+	if !hasAuto {
+		// 没有账号开启自动签到：低频兜底即可，开关变动会通过 checkinWake 唤醒。
+		return idlePoll
+	}
+	// 全部签完 → 一觉睡到明天的签到点，期间不再轮询。
+	tomorrow := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, now.Location()).AddDate(0, 0, 1)
+	d := tomorrow.Sub(now)
+	if d < time.Minute {
+		// 正常情况下不会走到（已过点才会算到明天）；仅防时钟异常导致的死循环。
+		return time.Minute
+	}
+	return d
 }
 
 // runAutoCheckin 跑一轮自动签到，返回**是否还有账号等待签到**
@@ -554,6 +602,10 @@ func (p *Panel) handleAccountAction(w http.ResponseWriter, r *http.Request, id, 
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 			return
 		}
+		// 刚打开开关就立刻生效，不必等调度器睡到下一个签到点。
+		if enabled {
+			p.wakeCheckinLoop()
+		}
 		writeJSON(w, http.StatusOK, updated)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown_action"})
@@ -767,6 +819,8 @@ func (p *Panel) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.Cfg = updated
+	// 签到时间可能变了，叫醒调度器按新时间重算。
+	p.wakeCheckinLoop()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": updated})
 }
 

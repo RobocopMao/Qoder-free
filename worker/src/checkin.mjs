@@ -119,13 +119,43 @@ async function nativeMachineIdentity(region) {
   if (nativeIdentityCache === null) return null;
   try {
     const { execFileSync } = await import("node:child_process");
-    const { existsSync } = await import("node:fs");
-    // 国际版与国内版是两个 App，优先按 region 选，另一个作兜底。
-    const candidates = region === "cn"
-      ? ["/Applications/Qoder CN.app/Contents/Resources/umid/runtime-info",
-         "/Applications/Qoder.app/Contents/Resources/umid/runtime-info"]
-      : ["/Applications/Qoder.app/Contents/Resources/umid/runtime-info",
-         "/Applications/Qoder CN.app/Contents/Resources/umid/runtime-info"];
+    const { existsSync, readdirSync } = await import("node:fs");
+    const { homedir } = await import("node:os");
+    // **优先用 worker home 里 CLI 自己解出来的那份二进制**，而不是 App 里的。
+    //
+    // 为什么（用户 m00313：「老是弹一个密钥的弹窗」）：
+    // App 里那份 `/Applications/Qoder CN.app/.../runtime-info` 会调用
+    // `SecItemCopyMatching` **去读**钥匙串里属于 Qoder CN.app 的条目
+    // （`acct="Qoder CN App Key"` / `svce="Qoder CN App Safe Storage"`）。
+    // worker 是另一个进程、另一种签名，读别人的条目 → macOS 弹
+    // 「xxx 想要使用钥匙串中的机密信息」授权框。
+    //
+    // 实测符号表对比：
+    //   App 那份         → SecItemAdd + **SecItemCopyMatching** + SecItemDelete（会读）
+    //   worker home 那份 → 只有 SecItemAdd（只写自己的，不读别人的 → 不弹窗）
+    //
+    // 两者**输出完全相同**（同机同源派生同一份设备令牌），换掉无副作用：
+    // 实测四个账号 home 里的与 App 那份逐字节同值。
+    const candidates = [];
+    const binDirs = region === "cn" ? [".qoder-cn", ".qoder"] : [".qoder", ".qoder-cn"];
+    for (const d of binDirs) {
+      try {
+        const dir = `${homedir()}/${d}/.bin`;
+        for (const f of readdirSync(dir)) {
+          if (f.startsWith("runtime-info")) candidates.push(`${dir}/${f}`);
+        }
+      } catch {
+        // 该 home 下还没解出二进制
+      }
+    }
+    // 兜底才用 App 里那份（用于 CLI 还没解出二进制的极早期）。
+    candidates.push(
+      ...(region === "cn"
+        ? ["/Applications/Qoder CN.app/Contents/Resources/umid/runtime-info",
+           "/Applications/Qoder.app/Contents/Resources/umid/runtime-info"]
+        : ["/Applications/Qoder.app/Contents/Resources/umid/runtime-info",
+           "/Applications/Qoder CN.app/Contents/Resources/umid/runtime-info"]),
+    );
     for (const bin of candidates) {
       if (!existsSync(bin)) continue;
       try {
