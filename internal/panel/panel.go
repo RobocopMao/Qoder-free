@@ -575,6 +575,13 @@ func (p *Panel) handleAccountAction(w http.ResponseWriter, r *http.Request, id, 
 		p.Pool.Sync(p.syncItems())
 		if enabled {
 			p.syncAccount(updated)
+			// 启用后**立刻叫醒签到调度器**。
+			//
+			// 用户 m00314：「我等会会打开」—— 打开账号（enable）时，调度器
+			// 可能正睡到明天签到点（`nextCheckinDelay` 只看 enabled &&
+			// auto_checkin 的账号，禁用期间算出来的是「全部签完」→ 睡到明天）。
+			// 不唤醒的话，今天打开也不会补签，得干等到明天 10:00。
+			p.wakeCheckinLoop()
 		}
 		writeJSON(w, http.StatusOK, updated)
 	case action == "login/start":

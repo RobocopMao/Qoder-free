@@ -30,7 +30,9 @@ func newTestPanel(t *testing.T, cfg config.Config, accts ...accounts.Account) *P
 			t.Fatalf("update account: %v", err)
 		}
 	}
-	return &Panel{Cfg: cfg, Store: st}
+	// checkinWake 必须初始化：wakeCheckinLoop 对 nil 通道是安全的（直接返回），
+	// 但测试要验证信号真的投递了，所以给一个真通道。
+	return &Panel{Cfg: cfg, Store: st, checkinWake: make(chan struct{}, 1)}
 }
 
 func acct(id string, enabled, auto bool, region, lastCheckin string) accounts.Account {
@@ -123,5 +125,52 @@ func TestWakeCheckinLoopIsNonBlocking(t *testing.T) {
 	case <-p.checkinWake:
 	default:
 		t.Fatal("应有一个待处理的唤醒信号")
+	}
+}
+
+// 用户 m00314：「我等会会打开」。
+//
+// 禁用期间 nextCheckinDelay 算出来是「睡到明天」（因为 enabled=false 的账号
+// 被跳过 → 等价于全部签完）。所以**打开账号时必须叫醒调度器**，
+// 否则今天打开也不会补签，得干等到明天 10:00。
+func TestEnableAccountMustWakeScheduler(t *testing.T) {
+	now := time.Date(2026, 10, 8, 14, 0, 0, 0, time.Local)
+	cfg := config.Config{CheckinHourLocal: 10}
+
+	// 复刻用户真实场景：企业号启用且今天已处理过，两个个人号被禁用。
+	// 调度器据此认为「全部签完」→ 睡到明天。
+	p := newTestPanel(t, cfg,
+		acct("ent", true, true, "cn", "2026-10-08T11:06:40+08:00"),
+		acct("personal", false, true, "cn", "2026-10-07T10:00:00+08:00"),
+	)
+	if sleeping := p.nextCheckinDelay(now); sleeping < 10*time.Hour {
+		t.Fatalf("两个个人号禁用时应睡到明天，got=%v", sleeping)
+	}
+
+	// 打开个人号（模拟 enable 动作）→ 应立刻变成「到点未签 → 0 延迟」。
+	var personalID string
+	for _, a := range p.Store.List() {
+		if a.Name == "personal" {
+			personalID = a.ID
+		}
+	}
+	if personalID == "" {
+		t.Fatal("找不到 personal 账号")
+	}
+	if _, err := p.Store.Update(personalID, func(a *accounts.Account) {
+		a.Enabled = true
+	}); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	if got := p.nextCheckinDelay(now); got != 0 {
+		t.Fatalf("启用后且已过签到点应立刻可签（0），got=%v", got)
+	}
+
+	// 并且 enable 动作要投递唤醒信号，否则调度器还在睡。
+	p.wakeCheckinLoop()
+	select {
+	case <-p.checkinWake:
+	default:
+		t.Fatal("enable 后应有唤醒信号")
 	}
 }
