@@ -174,3 +174,51 @@ func TestEnableAccountMustWakeScheduler(t *testing.T) {
 		t.Fatal("enable 后应有唤醒信号")
 	}
 }
+
+// 用户 m03482：「qoder 的自动签到没有触发」。
+//
+// 根因是 Go 定时器在 darwin 上用 `mach_absolute_time`（睡眠期间不走），
+// 「一觉睡到明天 10:00」跨过合盖睡眠后要晚一个睡眠时长才醒，签到点被跳过。
+// 修法是把实际定时器封顶到 30 分钟，每次醒来用墙钟重新评估。
+func TestClampCheckinSleepCapsLongSleep(t *testing.T) {
+	// 跨夜长睡（理论值可能十几小时）必须被压到 30 分钟，
+	// 否则睡眠期间单调时钟不走 → 漏签。
+	long := 15 * time.Hour
+	if got := clampCheckinSleep(long); got != maxCheckinSleep {
+		t.Fatalf("长睡眠应封顶到 %v，got=%v", maxCheckinSleep, got)
+	}
+	// 边界：正好等于上限时不应被改动。
+	if got := clampCheckinSleep(maxCheckinSleep); got != maxCheckinSleep {
+		t.Fatalf("等于上限时应保持 %v，got=%v", maxCheckinSleep, got)
+	}
+}
+
+func TestClampCheckinSleepLiftsZero(t *testing.T) {
+	// nextCheckinDelay 在「到点未签」时返回 0；若 worker 一直没就绪
+	// （waiting=true 不写 LastCheckinAt）就会零延迟热循环，必须有下限。
+	if got := clampCheckinSleep(0); got != minCheckinSleep {
+		t.Fatalf("0 延迟应抬到 %v，got=%v", minCheckinSleep, got)
+	}
+	if got := clampCheckinSleep(-time.Second); got != minCheckinSleep {
+		t.Fatalf("负值应抬到 %v，got=%v", minCheckinSleep, got)
+	}
+	// 区间内的值原样通过：比如「到点前 5 分钟」不该被改动。
+	mid := 5 * time.Minute
+	if got := clampCheckinSleep(mid); got != mid {
+		t.Fatalf("区间内应原样返回 %v，got=%v", mid, got)
+	}
+}
+
+func TestClampCheckinSleepBoundsAreSane(t *testing.T) {
+	if minCheckinSleep <= 0 {
+		t.Fatalf("下限必须为正，got=%v", minCheckinSleep)
+	}
+	if maxCheckinSleep <= minCheckinSleep {
+		t.Fatalf("上限 %v 必须大于下限 %v", maxCheckinSleep, minCheckinSleep)
+	}
+	// 上限要足够短才能兜住睡眠跳点（本机实测一次合盖睡了 7.2 小时），
+	// 但又不能短到变成事实上的轮询（会白跑唤醒、增加弹窗机会）。
+	if maxCheckinSleep > time.Hour {
+		t.Fatalf("上限 %v 太长，兜不住睡眠跳点", maxCheckinSleep)
+	}
+}

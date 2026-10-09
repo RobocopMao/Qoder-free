@@ -123,12 +123,22 @@ func (p *Panel) StartQuotaLoop(ctx context.Context) {
 // 所以现在按**下一个签到点**精确睡眠：算出来还有哪一天、几点需要动手，
 // 一觉睡到那时候（顺带每 30 分钟醒一次做兜底复查，防止系统休眠/时钟跳变
 // 导致长睡眠失效）。已经签完的账号不会再被打扰。
+//
+// **为什么必须每 30 分钟醒一次（2026-10-09 实测的漏签根因）**：
+// Go 的定时器走单调时钟，而 darwin 上单调时钟来自 `mach_absolute_time` ——
+// 系统睡眠期间它**不走**（对比 `mach_continuous_time`：本机开机 3.08 天里
+// 两者差了 21.8 小时，全是睡眠）。所以「一觉睡到明天 10:00」在合盖过夜后
+// 会整整晚一个睡眠时长才醒：10-08 23:45 起服务（三账号当天已签），
+// 夜间睡了 7.2 小时，到 10-09 11:47 单调时间只走了 4.9 小时（`uptime_s` 实测
+// 17406，墙钟 12.03 小时），10:00 的签到点被跳过，用户报「自动签到没有触发」。
+// 加上限后每次醒来都用**墙钟**重新评估；没到点时日期守卫在触网前就返回，
+// 不碰钥匙串、不弹授权、不打扰用户，所以与用户 m00313 的诉求并不冲突。
 func (p *Panel) StartCheckinLoop(ctx context.Context) {
 	p.runAutoCheckin(ctx)
 
 	go func() {
 		for {
-			wait := p.nextCheckinDelay(time.Now())
+			wait := clampCheckinSleep(p.nextCheckinDelay(time.Now()))
 			timer := time.NewTimer(wait)
 			select {
 			case <-ctx.Done():
@@ -157,6 +167,32 @@ func (p *Panel) wakeCheckinLoop() {
 	}
 }
 
+// 签到调度的时间边界。
+//
+// maxCheckinSleep 是**必须**的兜底：Go 定时器吃的是单调时钟，在 darwin 上
+// 睡眠期间不走（见 StartCheckinLoop 的说明），长睡眠会让签到点被整段跳过。
+// 封顶后每次醒来都用墙钟重算，睡多久都不丢点。
+// minCheckinSleep 防止 nextCheckinDelay 返回 0 时热循环：worker 没就绪会一直
+// 算作 pending（不写 LastCheckinAt），没有下限就会零延迟空转刷日志。
+const (
+	minCheckinSleep = 1 * time.Minute
+	maxCheckinSleep = 30 * time.Minute
+)
+
+// clampCheckinSleep 把调度器算出的睡眠时长夹到 [1m, 30m]。
+//
+// 注意**不改 nextCheckinDelay 本身**：那个函数要如实回答「理论上该睡多久」，
+// 现有测试也据此断言精确值；封顶只影响实际定时器，纯属执行层的事。
+func clampCheckinSleep(d time.Duration) time.Duration {
+	if d < minCheckinSleep {
+		return minCheckinSleep
+	}
+	if d > maxCheckinSleep {
+		return maxCheckinSleep
+	}
+	return d
+}
+
 // nextCheckinDelay 算出距离「下一次需要跑签到」还有多久。
 //
 // 规则：
@@ -167,13 +203,14 @@ func (p *Panel) wakeCheckinLoop() {
 func (p *Panel) nextCheckinDelay(now time.Time) time.Duration {
 	const idlePoll = 30 * time.Minute
 
-	// 注意这里**不设「每小时醒一次」的上限**（用户 m00313：「如果已经签到了，
-	// 就不用轮询」）。醒来却无事可做虽然不会触网（日期守卫在发请求前就
-	// continue 了），但会让日志和 CPU 白转；而「睡到明天签到点」本身是安全的：
-	// 期间任何配置/开关变动都会通过 `checkinWake` 立刻叫醒重算。
+	// 这里算的是**理论上**该睡多久（可能是十几小时），实际定时器由
+	// clampCheckinSleep 封顶到 30 分钟。封顶不放在这里，是因为本函数要如实
+	// 回答调度意图（测试也断言精确值），而「防睡眠跳点」是执行层的事。
 	//
-	// 只在「全部签完」那条路径给一个下限（60s），防止时钟跳变算出非正间隔
-	// 导致 select 空转。
+	// 之所以敢睡长觉又敢封顶：醒来无事可做不会触网（日期守卫在发请求前就
+	// continue 了），配置/开关变动也都会通过 `checkinWake` 立刻叫醒重算。
+	// 用户 m00313 的诉求（「如果已经签到了，就不用轮询，不然老是弹一个密钥的
+	// 弹窗」）针对的是**白跑上游、碰钥匙串**，而空醒只是重算一次本地时间。
 
 	hour := p.Cfg.CheckinHourLocal
 	today := now.Format("2006-01-02")
